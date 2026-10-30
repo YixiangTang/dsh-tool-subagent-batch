@@ -44,6 +44,14 @@
     "sync"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YixiangTang/dsh-tool-subagent-batch.git"
+  },
+  "homepage": "https://github.com/YixiangTang/dsh-tool-subagent-batch#readme",
+  "bugs": {
+    "url": "https://github.com/YixiangTang/dsh-tool-subagent-batch/issues"
+  },
   "engines": {
     "node": ">=20"
   }
