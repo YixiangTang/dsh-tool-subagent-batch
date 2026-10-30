@@ -8,3 +8,6 @@
       name: dsh-tool-subagent-batch
       config:
         provider: spawn
+        # sync waits for the full report; async returns a batch id and runs in
+        # the background for subagent_batch_status. A call may override this.
+        mode: sync

@@ -6,9 +6,12 @@
 
 **English** | [简体中文](README.zh.md)
 
-A rolling-window batch scheduler for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) subagents.
+A rolling-window batch scheduler for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) subagents, with **synchronous and asynchronous** parallel modes.
 
-One tool call carries a queue of independent subtasks and a concurrency window. The plugin starts up to *N* fresh children, and **the moment any child settles, the next queued task takes its slot**. When every task has settled, the call returns each child's final answer, stop reason, and durable child id, so the main agent can review and accept the work.
+One tool call carries a queue of independent subtasks and a concurrency window. The plugin starts up to *N* fresh children, and **the moment any child settles, the next queued task takes its slot**.
+
+- **Sync mode** — the call blocks until every task settles, then returns the complete report for acceptance.
+- **Async mode** — the call returns a batch id immediately; the pool keeps running in the background and is collected later with `subagent_batch_status`.
 
 ```
 tasks:   [1] [2] [3] [4] [5] [6]
@@ -16,6 +19,8 @@ window:  [1] [2] [3]          ← all start together
              ↓ 1 finishes
 window:      [2] [3] [4]      ← 4 backfills immediately
 ```
+
+This diagram describes the **shared rolling-window scheduler** used by both modes. The mode changes only how the result is delivered: `sync` returns it as the tool result, `async` returns a batch id and delivers it through `subagent_batch_status`.
 
 ## Why
 
@@ -25,45 +30,84 @@ DSH already has a `subagent` tool, but it returns as soon as a child is admitted
 - the parent has no single place to collect and compare results;
 - a failed child can be lost among unrelated completion notices.
 
-This plugin turns that into a **bounded, self-refilling pool** with one aggregated result for acceptance.
+This plugin turns that into a **bounded, self-refilling pool** with one aggregated report. Sync mode suits "do this batch now and give me the results"; async mode suits "start this batch and let me keep working".
 
 ## Features
 
+- **Two modes, one scheduler** — `sync` blocks for the report; `async` returns immediately and runs in the background.
 - **Rolling window, not fixed chunks** — a slot is refilled as soon as any child settles, not after the whole batch.
 - **User-owned concurrency** — explicit config, environment variable, or a hardware-based recommendation. The model cannot change it unless you opt in.
 - **Hardware-aware recommendation** — reads logical cores, total RAM, free RAM, and the Host admission cap.
+- **Async status tool** — poll progress, block with a timeout, or cancel a running batch.
 - **Per-task acceptance report** — status, final answer, stop reason, duration, and child id for every task.
 - **Failure isolation** — one failed child does not consume the queue; optional `fail_fast`.
-- **Cooperative cancellation** — cancelling the tool call stops admissions, disposes every running child, and leaves queued tasks unstarted.
+- **Cooperative cancellation** — sync cancellation stops admissions and disposes running children; async cancellation does the same through the status tool.
 - **Capacity backoff** — a host admission refusal is retried (30 × 500 ms) before a task is failed.
 - **Depth guard** — respects the Host `subagent.maxDepth` policy and the calling agent's current depth.
 - **Output clipping** — keeps one huge answer from flooding the parent context.
 - **Zero runtime dependencies** — Node builtins only, so it can be mounted as a single file.
 
+## Modes
+
+| | `sync` | `async` |
+|---|---|---|
+| Returns | after every task settles | immediately, with a batch id |
+| Parent turn | blocked for the whole batch | free to continue or end |
+| Collection | the tool result itself | `subagent_batch_status` |
+| Progress | none until done | snapshots per call |
+| Cancellation | abort the tool call | `cancel: true` on the status tool |
+| Best for | "run this batch now" | long batches, or parallel work alongside other tasks |
+
+The configured default is `mode: sync`; pass `"mode": "async"` per call, or set `mode: async` in the profile to make async the default.
+
+### Async lifecycle
+
+1. `subagent_batch` validates the tasks, provider, depth, and concurrency, starts the scheduler, and returns a **running snapshot** with a `batchId`.
+2. The pool continues in the same DSH process after the tool call returns.
+3. The main agent collects it with `subagent_batch_status`:
+   - `{ "batchId": "..." }` — immediate progress snapshot;
+   - `{ "batchId": "...", "wait": true, "timeout_ms": 120000 }` — block until it settles or the timeout expires;
+   - `{ "batchId": "...", "cancel": true }` — stop every running child and skip the queue.
+4. Finished batches stay readable for recent status calls, up to `retainedBatches`.
+
+Async mode does **not** push a completion message into the parent session. The main agent polls or waits with the status tool. This is deliberate: it keeps the parent transcript free of *N* completion notices and lets the caller decide when to collect.
+
 ## How it works
+
+Sync mode:
 
 ```mermaid
 sequenceDiagram
     participant M as Main agent
     participant T as subagent_batch
     participant S as ctx.subagents
-    participant C1 as Child 1
-    participant C2 as Child 2
-    participant C3 as Child 3
+    participant C as Children
 
-    M->>T: tasks[1..3], concurrency 2
-    T->>S: startActivation(C1, delivery=caller)
-    T->>S: startActivation(C2, delivery=caller)
-    S-->>C1: run
-    S-->>C2: run
-    T->>T: Promise.race(running)
-    C1-->>T: result
-    T->>S: startActivation(C3, delivery=caller)
-    C2-->>T: result
-    T-->>M: aggregated results
+    M->>T: tasks, mode=sync
+    T->>S: startActivation(delivery=caller) × window
+    S-->>C: run
+    C-->>T: results, refill on each settle
+    T-->>M: complete report
 ```
 
-The core is a small scheduler:
+Async mode:
+
+```mermaid
+sequenceDiagram
+    participant M as Main agent
+    participant T as subagent_batch
+    participant S as ctx.subagents
+    participant C as Children
+
+    M->>T: tasks, mode=async
+    T->>S: startActivation(delivery=caller) × window
+    T-->>M: batchId, status=running
+    Note over T,C: pool keeps running in the background
+    M->>T: subagent_batch_status(batchId, wait=true)
+    T-->>M: complete report
+```
+
+The core is a small scheduler shared by both modes:
 
 ```js
 while (cursor < tasks.length || running.size > 0) {
@@ -76,7 +120,7 @@ while (cursor < tasks.length || running.size > 0) {
 
 Each `runOne` calls `ctx.subagents.startActivation({ delivery: 'caller', ... })`, awaits `activation.result`, maps the stop reason, and disposes the activation in `finally`.
 
-`delivery: 'caller'` is deliberate: the subagent runtime does **not** inject a completion notice into the parent session. The batch call owns collection, so the main agent receives one deterministic report instead of *N* interleaved messages.
+`delivery: 'caller'` is deliberate: the subagent runtime does **not** inject a completion notice into the parent session. The batch owns collection, so the caller receives one deterministic report instead of *N* interleaved messages.
 
 ## Requirements
 
@@ -89,7 +133,7 @@ Each `runOne` calls `ctx.subagents.startActivation({ delivery: 'caller', ... })`
 
 ## Installation
 
-Pick one option. Both end with a tool named `subagent_batch` visible to the model.
+Pick one option. Both end with `subagent_batch` and `subagent_batch_status` visible to the model.
 
 ### Option 1 — bundle package (recommended)
 
@@ -135,6 +179,7 @@ Use this to try the plugin without touching `node_modules`. Add a row to `$DSH_H
       name: 'E:/path/to/dsh-tool-subagent-batch/index.js'
       config:
         concurrency: auto
+        mode: sync
 ```
 
 - Quote the path. Forward slashes work on Windows.
@@ -146,12 +191,16 @@ Use this to try the plugin without touching `node_modules`. Add a row to `$DSH_H
 | Field | Default | Meaning |
 |---|---|---|
 | `provider` | `spawn` | Subagent provider name on `ctx.subagents`. |
-| `toolName` | `subagent_batch` | Model-facing tool name. |
+| `toolName` | `subagent_batch` | Model-facing batch tool name. |
+| `statusToolName` | `subagent_batch_status` | Model-facing status tool for async batches. |
+| `mode` | `sync` | Default mode: `sync` or `async`. |
 | `concurrency` | `auto` | User-owned window: an integer `1..maxConcurrency`, or `auto`. |
 | `maxConcurrency` | `8` | Ceiling for `auto`, the environment, and (when enabled) the model. |
 | `allowModelConcurrency` | `false` | `false` hides the model parameter; `"lower"` lets the model only shrink the window; `true` lets it choose up to `maxConcurrency`. |
 | `maxTasks` | `32` | Largest queue one call may carry. |
 | `outputCharsPerTask` | `12000` | Characters of each child answer retained in the report. |
+| `maxAsyncBatches` | `8` | Concurrent async batches allowed per parent session. |
+| `retainedBatches` | `16` | Finished batches kept for later status reads. |
 | `maxDepth` | Host setting | Absolute delegation-depth cap; omit to use `subagent.maxDepth` (default `1`). |
 
 Unknown fields are rejected at mount, so a typo fails loudly instead of being silently ignored.
@@ -225,11 +274,11 @@ export DSH_SUBAGENT_BATCH_CONCURRENCY=4
 
 ## Usage
 
+### Sync mode
+
 Ask the main agent for a batch, for example:
 
-> I have six independent modules to review. Use `subagent_batch` to review them in parallel, at most three at a time, and report each result.
-
-The model calls:
+> I have six independent modules to review. Use `subagent_batch` in sync mode, at most three at a time, and report each result.
 
 ```json
 {
@@ -238,24 +287,93 @@ The model calls:
     { "description": "Review billing module", "prompt": "Review src/billing for ..." },
     { "description": "Review search module", "prompt": "Review src/search for ..." }
   ],
+  "mode": "sync",
   "fail_fast": false
 }
 ```
 
-With `concurrency: 3` the three children start immediately. With `concurrency: 2`, the third starts as soon as either of the first two settles.
+With `concurrency: 3` the three children start immediately. With `concurrency: 2`, the third starts as soon as either of the first two settles. The call returns the complete report.
+
+### Async mode
+
+> Start the same six reviews in async mode, then let me know when they are done.
+
+The model starts the batch:
+
+```json
+{
+  "tasks": [
+    { "description": "Review auth module", "prompt": "Review src/auth for ..." },
+    { "description": "Review billing module", "prompt": "Review src/billing for ..." }
+  ],
+  "mode": "async"
+}
+```
+
+The immediate result is a running snapshot:
+
+```json
+{
+  "batchId": "batch-1f0c...",
+  "mode": "async",
+  "status": "running",
+  "total": 2,
+  "completed": 0,
+  "failed": 0,
+  "cancelled": 0,
+  "skipped": 0,
+  "pending": 1,
+  "running": 1,
+  "concurrency": 3,
+  "concurrencySource": "config",
+  "startedAt": "2026-10-30T09:41:00.000Z",
+  "durationMs": 12,
+  "results": [
+    { "index": 1, "description": "Review auth module", "status": "running", "childId": "session-...", "output": "", "outputTruncated": false, "durationMs": 12 },
+    { "index": 2, "description": "Review billing module", "status": "pending", "output": "", "outputTruncated": false, "durationMs": 0 }
+  ]
+}
+```
+
+Later, collect it:
+
+```json
+{
+  "batchId": "batch-1f0c...",
+  "wait": true,
+  "timeout_ms": 120000
+}
+```
+
+`subagent_batch_status` accepts:
+
+| Field | Meaning |
+|---|---|
+| `batchId` | Required. The id returned by the async start. |
+| `wait` | Wait until the batch settles or the timeout expires. |
+| `timeout_ms` | Wait bound, `1000..600000`, default `60000`. |
+| `cancel` | Cancel the batch and wait for its children to stop. |
+
+Only the session that started the batch can read or cancel it. Without `wait`, the call returns a snapshot immediately; poll it to show progress.
 
 ### Result
 
 ```json
 {
   "batchId": "batch-1f0c...",
+  "mode": "sync",
+  "status": "completed",
   "total": 3,
   "completed": 2,
   "failed": 1,
   "cancelled": 0,
   "skipped": 0,
+  "pending": 0,
+  "running": 0,
   "concurrency": 3,
   "concurrencySource": "config",
+  "startedAt": "2026-10-30T09:41:00.000Z",
+  "finishedAt": "2026-10-30T09:41:48.000Z",
   "durationMs": 48210,
   "results": [
     {
@@ -288,20 +406,36 @@ With `concurrency: 3` the three children start immediately. With `concurrency: 2
 
 ### Statuses
 
+Batch status:
+
 | Status | Meaning |
 |---|---|
+| `running` | The pool has not settled; some tasks may be pending or running. |
+| `completed` | Every task settled (individually completed, failed, or skipped). |
+| `cancelled` | The batch was cancelled before every task settled. |
+
+Task status:
+
+| Status | Meaning |
+|---|---|
+| `pending` | Queued, not admitted yet. |
+| `running` | A child is executing this task. |
 | `completed` | Child stopped with `stopReason: "completed"`. |
 | `failed` | Start rejection, child error, or non-completed stop reason. |
-| `cancelled` | Child stopped because the batch call was cancelled. |
-| `skipped` | Never started, because `fail_fast` fired or the call was cancelled. |
+| `cancelled` | Child stopped because the batch was cancelled. |
+| `skipped` | Never started, because `fail_fast` fired or the batch was cancelled. |
 
 ## Semantics and guarantees
 
-- **Submission order** — tasks are admitted from index 0 upward; results are always returned in submission order.
+- **Submission order** — tasks are admitted from index 0 upward; results are always in submission order.
 - **Refill on any settle** — success and failure both free a slot.
 - **Bounded queue** — at most `concurrency` children are live at once; the rest wait in-process.
 - **Failure isolation** — a failed task never stops the queue unless `fail_fast: true`; running children still finish.
-- **Cancellation** — the tool observes `exec.signal`; on abort it disposes every running activation, stops admitting, waits for cleanup, then lets the call settle as `ABORTED`.
+- **Sync cancellation** — the tool observes `exec.signal`; on abort it disposes every running activation, stops admitting, waits for cleanup, then lets the call settle as `ABORTED`.
+- **Async cancellation** — the status tool aborts the batch, disposes running activations, and returns a `cancelled` report.
+- **Async ownership** — only the exact owning session can inspect or cancel a batch.
+- **Async retention** — finished batches stay in process memory for `retainedBatches` entries; older finished batches are evicted. Running batches are never evicted.
+- **Parent disposal** — disposing the parent session cancels its running async batches; plugin unload cancels every batch.
 - **Capacity backoff** — `ACTIVATION_LIMIT_REACHED` is retried every 500 ms up to 30 times, then fails only that task.
 - **Depth** — a child at the depth cap is rejected with an actionable error instead of silently starting a doomed descendant.
 - **No completion notices** — with `delivery: 'caller'` the parent receives one report, not one message per child.
@@ -313,12 +447,13 @@ With `concurrency: 3` the three children start immediately. With `concurrency: 2
 - Batch children inherit the calling agent's fixed delegated permission scope. They cannot widen it or obtain new approvals; an operation that would require approval inside a child is rejected.
 - The plugin adds no network, filesystem, or process access of its own.
 - Task prompts are sent to the configured model provider as child conversations; do not put secrets in prompts that the provider should not see.
+- Async batches keep running after the start call returns. Cancel them explicitly when they are no longer wanted, or dispose the parent session.
 
 ## Compatibility
 
-- Built against DSH `0.2.1-rc.5` and the public `0.2.x` plugin seams. The scheduler is unit-tested with a fake `ctx.subagents`; run one real batch in your deployment before relying on it.
+- Built against DSH `0.2.1-rc.5` and the public `0.2.x` plugin seams. The scheduler and both modes are unit-tested with a fake `ctx.subagents`; run one real batch in your deployment before relying on it.
 - Optional integration: reads `ctx.subagents.config.maxActiveSubagents` when present and falls back gracefully when it is not.
-- The tool schema is plain JSON Schema from the DSH-supported subset (`type`, `properties`, `required`, `additionalProperties`, `items`, `enum`, `description`).
+- The tool schemas use plain JSON Schema from the DSH-supported subset (`type`, `properties`, `required`, `additionalProperties`, `items`, `enum`, `description`).
 - No peer package is imported at runtime; the plugin is a single ESM file.
 
 ## Troubleshooting
@@ -326,16 +461,23 @@ With `concurrency: 3` the three children start immediately. With `concurrency: 2
 | Symptom | Cause / fix |
 |---|---|
 | `subagent_batch` is not visible | The row is disabled, the profile did not reload, or `tools`/`subagents` are not mounted. Check the Loader log and restart. |
+| `subagent_batch_status` is not visible | It is registered next to the batch tool. Check tool restrictions for the session; both use the same plugin row. |
 | `subagent provider "spawn" is not registered` | Mount `@deepseek-ai/dsh-subagent-spawn-in-process`, or set `provider` to a registered backend. |
 | `concurrency is user-controlled` | The model passed `concurrency` while `allowModelConcurrency` is `false`. That is the intended policy; enable `"lower"` or `true` to allow it. |
 | `ACTIVATION_LIMIT_REACHED` after retries | Other children occupy the Host admission tree. Lower `concurrency` or raise `subagent.maxActiveSubagents`. |
 | `cannot delegate from depth ...` | The caller already sits at `subagent.maxDepth` (default 1). Do the work in the child directly or raise the limit. |
+| `unknown or expired batch` | The id is wrong, the process restarted, or the batch was evicted by `retainedBatches`. Finished batches are process-local. |
+| `batch ... belongs to another session` | Only the session that started an async batch can inspect or cancel it. |
+| `already has N running asynchronous batches` | Raise `maxAsyncBatches`, or wait for one to settle. |
+| Async batch finished but no message arrived | Async mode does not push notifications by design. Call `subagent_batch_status` with `wait: true`. |
 | Recommendation feels too high | Set an explicit `concurrency`. The heuristic is a starting point, not a promise about API rate limits. |
-| `npm test` fails with `spawn EPERM` in a restricted sandbox | The Node test runner spawns workers. Run `npm run test:unit`, which executes the files in-process. |
+| `npm test` fails with `spawn EPERM` in a restricted sandbox | The Node test runner spawns workers. Run `npm run test:unit`, which executes the test files in-process. |
 
 ## Limitations
 
-- The tool call is **blocking**: the parent turn waits until every task settles. Child progress is not streamed; only the final report is returned.
+- **Sync mode is blocking**: the parent turn waits until every task settles; child progress is not streamed.
+- **Async mode has no push notification**: the parent must poll or wait with `subagent_batch_status`. Progress is per task, not per token.
+- **Async state is process-local**: a DSH restart loses batch ids and reports. Running children are cancelled on parent disposal or plugin unload.
 - One call is one batch. A second batch starts a new window; the plugin does not merge queues.
 - Failed tasks are not retried automatically — the main agent decides whether to rerun or continue a child.
 - A child's final message is clipped at `outputCharsPerTask`; the full transcript remains in the child session.

@@ -3,9 +3,12 @@
  *
  * One tool call carries a list of independent subtasks and a concurrency
  * window. The tool starts up to `concurrency` fresh children, and every time a
- * child settles it immediately admits the next queued task. The call returns
- * only after every task settles, with each child's final answer, stop reason,
- * and durable child id, so the calling agent can review and accept the work.
+ * child settles it immediately admits the next queued task.
+ *
+ * Two modes share the same scheduler:
+ *   - `sync`  blocks until every task settles and returns the full report.
+ *   - `async` returns a batch id immediately, keeps the pool running in the
+ *             background, and is collected with `subagent_batch_status`.
  *
  * Concurrency is user-owned by default: it comes from plugin configuration, an
  * environment variable, or a hardware recommendation. The model can only
@@ -41,6 +44,10 @@ const DEFAULTS = Object.freeze({
   provider: 'spawn',
   /** Model-facing tool name. */
   toolName: 'subagent_batch',
+  /** Model-facing status tool name for asynchronous batches. */
+  statusToolName: 'subagent_batch_status',
+  /** Default mode when a call omits `mode`: `sync` or `async`. */
+  mode: 'sync',
   /** User-owned window: an integer, or `auto` for a hardware recommendation. */
   concurrency: 'auto',
   /** Largest window `auto`, the environment, or the model may select. */
@@ -51,6 +58,10 @@ const DEFAULTS = Object.freeze({
   maxTasks: 32,
   /** Per-task output characters retained in the tool result. */
   outputCharsPerTask: 12000,
+  /** Concurrent asynchronous batches allowed per parent session. */
+  maxAsyncBatches: 8,
+  /** Finished batches retained for later status reads. */
+  retainedBatches: 16,
   /** Delegation-depth cap; undefined samples the Host `subagent.maxDepth` setting. */
   maxDepth: undefined,
 })
@@ -61,6 +72,55 @@ const CAPACITY_CODE = 'ACTIVATION_LIMIT_REACHED'
 const CAPACITY_RETRIES = 30
 /** Unknown configuration keys are rejected instead of silently ignored. */
 const CONFIG_KEYS = new Set(Object.keys(DEFAULTS))
+
+/** Status-tool wait bounds, in milliseconds. */
+const MIN_WAIT_MS = 1000
+const MAX_WAIT_MS = 600000
+const DEFAULT_WAIT_MS = 60000
+
+/** One batch report schema shared by the batch and status tools. */
+const REPORT_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    batchId: { type: 'string' },
+    mode: { type: 'string', enum: ['sync', 'async'] },
+    status: { type: 'string', enum: ['running', 'completed', 'cancelled'] },
+    total: { type: 'integer' },
+    completed: { type: 'integer' },
+    failed: { type: 'integer' },
+    cancelled: { type: 'integer' },
+    skipped: { type: 'integer' },
+    pending: { type: 'integer' },
+    running: { type: 'integer' },
+    concurrency: { type: 'integer' },
+    concurrencySource: { type: 'string', enum: ['config', 'env', 'auto', 'model'] },
+    startedAt: { type: 'string' },
+    finishedAt: { type: 'string' },
+    durationMs: { type: 'integer' },
+    results: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          index: { type: 'integer' },
+          description: { type: 'string' },
+          status: { type: 'string', enum: ['pending', 'running', 'completed', 'failed', 'cancelled', 'skipped'] },
+          childId: { type: 'string' },
+          stopReason: { type: 'string' },
+          output: { type: 'string' },
+          outputTruncated: { type: 'boolean' },
+          durationMs: { type: 'integer' },
+          error: { type: 'string' },
+          diagnostic: { type: 'string' },
+        },
+        required: ['index', 'description', 'status', 'output', 'outputTruncated', 'durationMs'],
+      },
+    },
+  },
+  required: ['batchId', 'mode', 'status', 'total', 'completed', 'failed', 'cancelled', 'skipped', 'pending', 'running', 'concurrency', 'concurrencySource', 'startedAt', 'durationMs', 'results'],
+}
 
 /**
  * Read and validate plugin configuration at mount time.
@@ -75,6 +135,9 @@ function readConfig(raw) {
   const config = { ...DEFAULTS, ...raw }
   if (typeof config.provider !== 'string' || config.provider.trim() === '') throw new TypeError('[subagent-batch] config.provider must be a non-empty string')
   if (typeof config.toolName !== 'string' || !/^[a-z][a-z0-9_]*$/.test(config.toolName)) throw new TypeError('[subagent-batch] config.toolName must match /^[a-z][a-z0-9_]*$/')
+  if (typeof config.statusToolName !== 'string' || !/^[a-z][a-z0-9_]*$/.test(config.statusToolName)) throw new TypeError('[subagent-batch] config.statusToolName must match /^[a-z][a-z0-9_]*$/')
+  if (config.statusToolName === config.toolName) throw new TypeError('[subagent-batch] config.statusToolName must differ from config.toolName')
+  if (config.mode !== 'sync' && config.mode !== 'async') throw new TypeError('[subagent-batch] config.mode must be "sync" or "async"')
   config.maxConcurrency = positiveInteger(config.maxConcurrency, 'config.maxConcurrency', 1, 64)
   if (config.concurrency !== 'auto') {
     config.concurrency = positiveInteger(config.concurrency, 'config.concurrency', 1, config.maxConcurrency)
@@ -84,6 +147,8 @@ function readConfig(raw) {
   }
   config.maxTasks = positiveInteger(config.maxTasks, 'config.maxTasks', 1, 256)
   config.outputCharsPerTask = positiveInteger(config.outputCharsPerTask, 'config.outputCharsPerTask', 500, 1000000)
+  config.maxAsyncBatches = positiveInteger(config.maxAsyncBatches, 'config.maxAsyncBatches', 1, 64)
+  config.retainedBatches = positiveInteger(config.retainedBatches, 'config.retainedBatches', 1, 256)
   if (config.maxDepth !== undefined) config.maxDepth = nonNegativeInteger(config.maxDepth, 'config.maxDepth')
   return config
 }
@@ -105,7 +170,7 @@ function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value))
 }
 
-/** Round to one decimal for human-facing bandwidth. */
+/** Round to one decimal for human-facing output. */
 function round1(value) {
   return Math.round(value * 10) / 10
 }
@@ -313,6 +378,18 @@ function readTasks(raw, config) {
 }
 
 /**
+ * Read and validate the requested mode.
+ * @param raw - model-supplied `mode`, possibly absent.
+ * @param config - plugin configuration.
+ * @returns `sync` or `async`.
+ */
+function readMode(raw, config) {
+  if (raw === undefined || raw === null) return config.mode
+  if (raw !== 'sync' && raw !== 'async') throw new Error('`mode` must be "sync" or "async"')
+  return raw
+}
+
+/**
  * Read an optional model-requested window, enforcing the user's policy.
  * @param raw - model-supplied `concurrency`.
  * @param config - plugin configuration.
@@ -331,6 +408,34 @@ function readRequestedConcurrency(raw, config, resolution, hostCap) {
       : `\`concurrency\` cannot exceed the configured maximum ${ceiling}.`)
   }
   return raw
+}
+
+/** Read and bound a status wait timeout. */
+function readTimeout(raw) {
+  if (raw === undefined || raw === null) return DEFAULT_WAIT_MS
+  if (!Number.isSafeInteger(raw) || raw < MIN_WAIT_MS || raw > MAX_WAIT_MS) throw new Error(`\`timeout_ms\` must be an integer from ${MIN_WAIT_MS} to ${MAX_WAIT_MS}`)
+  return raw
+}
+
+/**
+ * Wait for a promise at most `ms`, resolving either way.
+ * @param promise - the work to wait for.
+ * @param ms - timeout in milliseconds.
+ * @returns whether the promise settled before the timeout.
+ */
+function waitAtMost(promise, ms) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      resolve(false)
+    }, ms)
+    promise.then(() => {
+      clearTimeout(timer)
+      resolve(true)
+    }, () => {
+      clearTimeout(timer)
+      resolve(true)
+    })
+  })
 }
 
 /**
@@ -383,7 +488,7 @@ function sourceLabel(source) {
   }
 }
 
-/** Build the model-facing tool description. */
+/** Build the model-facing batch tool description. */
 function describe(config, resolution) {
   const ownership = config.allowModelConcurrency === false
     ? 'The window is fixed by the user and this call has no concurrency parameter. '
@@ -394,16 +499,19 @@ function describe(config, resolution) {
     'Run several independent subtasks in one call through managed subagents, using a rolling concurrency window: '
     + `by default up to ${resolution.concurrency} children run at once (${sourceLabel(resolution.source)}), and every time a child settles the next queued task starts immediately. `
     + 'Prefer this over calling `subagent` once per task when you have many independent subtasks or want a bounded, self-refilling batch. '
+    + 'Two modes are available. `sync` blocks until every task settles and returns the complete report. '
+    + `\`async\` returns a batch id immediately, keeps the pool running in the background, and is collected later with \`${config.statusToolName}\`. `
+    + `The configured default is \`${config.mode}\`. `
     + ownership
     + 'Each child is a fresh agent that does not see this conversation, so every `prompt` must be fully self-contained. '
-    + 'The call returns after every task settles with each child\'s final answer, stop reason, and durable child id; you are the scheduler and the acceptance reviewer — verify each result, then retry or continue individual children (e.g. with `send_message` to a returned child id) when the deployment offers that tool. '
-    + 'Tasks start in submission order. A failed task does not stop the others unless `fail_fast` is true. Cancelling this call stops admissions and cancels running children; queued tasks never start. '
+    + 'The final report carries each child\'s answer, stop reason, and durable child id; you are the scheduler and the acceptance reviewer — verify each result, then retry or continue individual children (e.g. with `send_message` to a returned child id) when the deployment offers that tool. '
+    + 'Tasks start in submission order. A failed task does not stop the others unless `fail_fast` is true. Cancelling a sync call stops admissions and cancels running children; an async batch is cancelled through the status tool. '
     + 'For long deliverables, ask each child to write files and report a short summary instead of returning the whole artifact in its final message.'
   )
 }
 
 /**
- * Install the tool.
+ * Install the tools.
  * @param ctx - registrant context carrying `tools` and `subagents`.
  * @param rawConfig - loader configuration.
  */
@@ -413,6 +521,24 @@ export function apply(ctx, rawConfig) {
   const resolution = resolveConcurrency(config, { hostCap })
   if (resolution.warning !== undefined) ctx.logger?.warn?.(`[subagent-batch] ${resolution.warning}`)
   ctx.logger?.info?.(`[subagent-batch] concurrency ${resolution.concurrency} (${resolution.source}) — ${resolution.reason}`)
+
+  /** @type {Map<string, ReturnType<typeof createBatch>>} */
+  const batches = new Map()
+
+  const pruneBatches = () => {
+    const finished = [...batches.values()].filter((batch) => batch.settled)
+    while (batches.size > config.retainedBatches && finished.length > 0) {
+      const oldest = finished.shift()
+      batches.delete(oldest.id)
+    }
+  }
+
+  const cancelAll = async (reason) => {
+    const all = [...batches.values()]
+    for (const batch of all) void batch.cancel(reason)
+    await Promise.all(all.map((batch) => batch.done))
+    batches.clear()
+  }
 
   const parameters = {
     type: 'object',
@@ -441,6 +567,11 @@ export function apply(ctx, rawConfig) {
           required: ['description', 'prompt'],
         },
       },
+      mode: {
+        type: 'string',
+        enum: ['sync', 'async'],
+        description: `sync waits for every task and returns the full report; async returns a batch id immediately and runs in the background for \`${config.statusToolName}\`. Default ${config.mode}.`,
+      },
       fail_fast: {
         type: 'boolean',
         description: 'When true, stop starting queued tasks after the first failure; already-running children still finish. Default false.',
@@ -457,48 +588,13 @@ export function apply(ctx, rawConfig) {
     }
   }
 
-  const definition = {
+  const batchTool = {
     name: config.toolName,
     description: describe(config, resolution),
     parameters,
     output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          batchId: { type: 'string' },
-          total: { type: 'integer' },
-          completed: { type: 'integer' },
-          failed: { type: 'integer' },
-          cancelled: { type: 'integer' },
-          skipped: { type: 'integer' },
-          concurrency: { type: 'integer' },
-          concurrencySource: { type: 'string', enum: ['config', 'env', 'auto', 'model'] },
-          durationMs: { type: 'integer' },
-          results: {
-            type: 'array',
-            items: {
-              type: 'object',
-              additionalProperties: false,
-              properties: {
-                index: { type: 'integer' },
-                description: { type: 'string' },
-                status: { type: 'string', enum: ['completed', 'failed', 'cancelled', 'skipped'] },
-                childId: { type: 'string' },
-                stopReason: { type: 'string' },
-                output: { type: 'string' },
-                outputTruncated: { type: 'boolean' },
-                durationMs: { type: 'integer' },
-                error: { type: 'string' },
-                diagnostic: { type: 'string' },
-              },
-              required: ['index', 'description', 'status', 'output', 'outputTruncated', 'durationMs'],
-            },
-          },
-        },
-        required: ['batchId', 'total', 'completed', 'failed', 'cancelled', 'skipped', 'concurrency', 'concurrencySource', 'durationMs', 'results'],
-      },
-      render: renderResult,
+      schema: REPORT_SCHEMA,
+      render: (args, value) => renderResult(args, value, config),
     },
     async execute(args, exec) {
       const parent = exec.agent
@@ -506,6 +602,7 @@ export function apply(ctx, rawConfig) {
       const signal = exec.signal
       signal.throwIfAborted()
       const tasks = readTasks(args?.tasks, config)
+      const mode = readMode(args?.mode, config)
       const failFast = args?.fail_fast === true
       const maxDepth = resolveMaxDepth(ctx, config)
       assertDepth(maxDepth, parent)
@@ -522,155 +619,317 @@ export function apply(ctx, rawConfig) {
       const provider = ctx.subagents.getProvider(config.provider)
       if (provider === undefined) throw new Error(`subagent_batch: subagent provider "${config.provider}" is not registered; mount a provider plugin such as @deepseek-ai/dsh-subagent-spawn-in-process`)
 
-      const batchId = `batch-${randomUUID()}`
-      const batchStartedAt = Date.now()
-      /** @type {Map<number, {activation?: any, disposal?: Promise<void>, startedAt: number}>} */
-      const runningRecords = new Map()
-      /** @type {Map<number, Promise<void>>} */
-      const runningPromises = new Map()
-      const results = new Array(tasks.length)
-      let cursor = 0
-      let stopStarting = false
-      let stopping = false
-
-      const disposeRecord = (record) => {
-        if (record.activation === undefined) return Promise.resolve()
-        record.disposal ??= Promise.resolve()
-          .then(() => record.activation.dispose())
-          .catch((error) => {
-            ctx.logger?.warn?.(`[subagent-batch] child dispose failed: ${failureText(error)}`)
-          })
-        return record.disposal
+      if (mode === 'async') {
+        const active = [...batches.values()].filter((batch) => batch.parentId === parent.id && !batch.settled).length
+        if (active >= config.maxAsyncBatches) throw new Error(`this session already has ${active} running asynchronous batches; the limit is ${config.maxAsyncBatches}. Wait for one to finish or raise maxAsyncBatches.`)
+        const batch = createBatch({ ctx, config, parent, tasks, concurrency, concurrencySource, mode, failFast, maxDepth })
+        batches.set(batch.id, batch)
+        pruneBatches()
+        return batch.report()
       }
 
-      const onAbort = () => {
-        stopping = true
-        for (const record of runningRecords.values()) void disposeRecord(record)
-      }
+      const batch = createBatch({ ctx, config, parent, tasks, concurrency, concurrencySource, mode, failFast, maxDepth })
+      const onAbort = () => { void batch.cancel(signal.reason) }
       signal.addEventListener('abort', onAbort, { once: true })
-
-      const startActivation = async (task) => {
-        let attempt = 0
-        for (;;) {
-          signal.throwIfAborted()
-          if (stopping) throw new Error('batch is stopping')
-          try {
-            return await ctx.subagents.startActivation({
-              provider: config.provider,
-              label: task.description,
-              delivery: 'caller',
-              signal,
-              request: {
-                parent,
-                prompt: [{ type: 'text', text: task.prompt }],
-                ...task.cwd === undefined ? {} : { cwd: task.cwd },
-                ...maxDepth === undefined ? {} : { maxDepth },
-              },
-            })
-          } catch (error) {
-            if (!isCapacityError(error) || attempt >= CAPACITY_RETRIES) throw error
-            attempt += 1
-            await sleep(500, signal)
-          }
-        }
-      }
-
-      const runOne = async (index) => {
-        const task = tasks[index]
-        const record = { startedAt: Date.now() }
-        let outcome
-        try {
-          const activation = await startActivation(task)
-          record.activation = activation
-          runningRecords.set(index, record)
-          if (stopping || signal.aborted) {
-            await disposeRecord(record)
-            outcome = baseOutcome(index, task, 'cancelled', record.startedAt, activation.childId)
-          } else {
-            let settled
-            try {
-              settled = await activation.result
-            } catch (error) {
-              outcome = {
-                ...baseOutcome(index, task, 'failed', record.startedAt, activation.childId),
-                error: failureText(error),
-              }
-            }
-            if (outcome === undefined) {
-              const stopReason = typeof settled?.stopReason === 'string' ? settled.stopReason : 'error'
-              const text = outputText(settled?.output)
-              const clipped = clipOutput(text, config.outputCharsPerTask)
-              const status = stopReason === 'completed' ? 'completed' : stopReason === 'aborted' ? 'cancelled' : 'failed'
-              outcome = {
-                ...baseOutcome(index, task, status, record.startedAt, activation.childId),
-                stopReason,
-                output: clipped.output,
-                outputTruncated: clipped.truncated,
-                ...typeof settled?.diagnostic === 'string' && settled.diagnostic !== '' ? { diagnostic: settled.diagnostic } : {},
-                ...status === 'failed' ? { error: `child stopped with reason "${stopReason}"` } : {},
-              }
-            }
-          }
-        } catch (error) {
-          outcome = {
-            ...baseOutcome(index, task, 'failed', record.startedAt, undefined),
-            error: failureText(error),
-          }
-        } finally {
-          await disposeRecord(record)
-          runningRecords.delete(index)
-        }
-        results[index] = outcome
-        if (outcome.status === 'failed' && failFast) stopStarting = true
-      }
-
       try {
-        while (cursor < tasks.length || runningPromises.size > 0) {
-          if (!stopStarting && !stopping && !signal.aborted) {
-            while (runningPromises.size < concurrency && cursor < tasks.length) {
-              const index = cursor
-              cursor += 1
-              const promise = runOne(index)
-              runningPromises.set(index, promise)
-              void promise.then(
-                () => runningPromises.delete(index),
-                () => runningPromises.delete(index),
-              )
-            }
-          }
-          if (runningPromises.size === 0) break
-          await Promise.race(runningPromises.values())
-        }
+        const report = await batch.done
+        signal.throwIfAborted()
+        return report
       } finally {
         signal.removeEventListener('abort', onAbort)
-      }
-
-      for (let index = 0; index < tasks.length; index++) {
-        if (results[index] === undefined) {
-          results[index] = {
-            ...baseOutcome(index, tasks[index], 'skipped', Date.now(), undefined),
-            error: stopStarting ? 'not started because fail_fast was triggered' : 'not started because the batch was cancelled',
-          }
-        }
-      }
-
-      signal.throwIfAborted()
-
-      const counts = { completed: 0, failed: 0, cancelled: 0, skipped: 0 }
-      for (const result of results) counts[result.status] += 1
-      return {
-        batchId,
-        total: tasks.length,
-        ...counts,
-        concurrency,
-        concurrencySource,
-        durationMs: Date.now() - batchStartedAt,
-        results,
       }
     },
   }
 
-  ctx.effect(() => ctx.tools.register(definition))
+  const statusTool = {
+    name: config.statusToolName,
+    description: `Inspect, wait for, or cancel an asynchronous batch started by \`${config.toolName}\` with \`mode: "async"\`. Only the session that started the batch may read it. Use \`wait: true\` to block until the batch settles or \`timeout_ms\` expires; use \`cancel: true\` to stop every running child and skip the queue.`,
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        batchId: {
+          type: 'string',
+          description: 'The batch id returned by the asynchronous start call.',
+        },
+        wait: {
+          type: 'boolean',
+          description: `When true, wait until the batch settles or timeout_ms expires. Default false.`,
+        },
+        timeout_ms: {
+          type: 'integer',
+          description: `Maximum wait in milliseconds (${MIN_WAIT_MS}..${MAX_WAIT_MS}, default ${DEFAULT_WAIT_MS}).`,
+        },
+        cancel: {
+          type: 'boolean',
+          description: 'When true, cancel the batch and wait for its children to stop. Default false.',
+        },
+      },
+      required: ['batchId'],
+    },
+    output: {
+      schema: REPORT_SCHEMA,
+      render: (args, value) => renderResult(args, value, config),
+    },
+    async execute(args, exec) {
+      const parent = exec.agent
+      if (parent === undefined) throw new Error(`${config.statusToolName} requires an owning agent session`)
+      const batchId = typeof args?.batchId === 'string' ? args.batchId.trim() : ''
+      if (batchId === '') throw new Error('`batchId` must be the id returned by an asynchronous batch start')
+      const batch = batches.get(batchId)
+      if (batch === undefined) throw new Error(`unknown or expired batch "${batchId}"; asynchronous batches live in this process and are retained only for recent status reads`)
+      if (batch.parentId !== parent.id) throw new Error(`batch "${batchId}" belongs to another session`)
+      if (args?.cancel === true) {
+        await batch.cancel(new Error('cancelled by the owning session'))
+        return batch.report()
+      }
+      if (args?.wait === true) {
+        await waitAtMost(batch.done, readTimeout(args?.timeout_ms))
+      }
+      return batch.report()
+    },
+  }
+
+  ctx.effect(() => ctx.tools.register(batchTool))
+  ctx.effect(() => ctx.tools.register(statusTool))
+  ctx.on('agent/disposed', ({ agent }) => {
+    for (const batch of batches.values()) {
+      if (batch.parentId === agent.id && !batch.settled) void batch.cancel(new Error('parent session disposed'))
+    }
+  })
+  ctx.effect(() => () => cancelAll(new Error('plugin disposed')))
+}
+
+/**
+ * Build one batch: the queue, the rolling window, cancellation, and snapshots.
+ * The scheduler starts immediately; callers await `done` (sync) or store the
+ * batch for later status reads (async).
+ *
+ * @param options - context, config, parent, tasks, window, and mode.
+ * @returns the live batch handle.
+ */
+function createBatch(options) {
+  const { ctx, config, parent, tasks, concurrency, concurrencySource, mode, failFast, maxDepth } = options
+  const id = `batch-${randomUUID()}`
+  const startedAt = Date.now()
+  const controller = new AbortController()
+  const signal = controller.signal
+  const results = new Array(tasks.length)
+  const states = new Array(tasks.length).fill('pending')
+  const stateStarted = new Array(tasks.length).fill(0)
+  /** @type {Map<number, {activation?: any, disposal?: Promise<void>, startedAt: number}>} */
+  const runningRecords = new Map()
+  /** @type {Map<number, Promise<void>>} */
+  const runningPromises = new Map()
+  let cursor = 0
+  let stopStarting = false
+  let stopping = false
+  let settled = false
+  let cancelled = false
+  let finishedAt
+  let failure
+  let resolveDone
+  const done = new Promise((resolve) => { resolveDone = resolve })
+
+  const disposeRecord = (record) => {
+    if (record.activation === undefined) return Promise.resolve()
+    record.disposal ??= Promise.resolve()
+      .then(() => record.activation.dispose())
+      .catch((error) => {
+        ctx.logger?.warn?.(`[subagent-batch] child dispose failed: ${failureText(error)}`)
+      })
+    return record.disposal
+  }
+
+  const onAbort = () => {
+    if (settled) return
+    stoppedByCancel()
+  }
+
+  const stoppedByCancel = () => {
+    stopping = true
+    cancelled = true
+    for (const record of runningRecords.values()) void disposeRecord(record)
+  }
+
+  signal.addEventListener('abort', onAbort, { once: true })
+
+  const startActivation = async (task) => {
+    let attempt = 0
+    for (;;) {
+      signal.throwIfAborted()
+      if (stopping) throw new Error('batch is stopping')
+      try {
+        return await ctx.subagents.startActivation({
+          provider: config.provider,
+          label: task.description,
+          delivery: 'caller',
+          signal,
+          request: {
+            parent,
+            prompt: [{ type: 'text', text: task.prompt }],
+            ...task.cwd === undefined ? {} : { cwd: task.cwd },
+            ...maxDepth === undefined ? {} : { maxDepth },
+          },
+        })
+      } catch (error) {
+        if (!isCapacityError(error) || attempt >= CAPACITY_RETRIES) throw error
+        attempt += 1
+        await sleep(500, signal)
+      }
+    }
+  }
+
+  const runOne = async (index) => {
+    const task = tasks[index]
+    const record = { startedAt: Date.now() }
+    states[index] = 'running'
+    stateStarted[index] = record.startedAt
+    let outcome
+    try {
+      const activation = await startActivation(task)
+      record.activation = activation
+      runningRecords.set(index, record)
+      if (stopping || signal.aborted) {
+        await disposeRecord(record)
+        outcome = baseOutcome(index, task, 'cancelled', record.startedAt, activation.childId)
+      } else {
+        let settledResult
+        try {
+          settledResult = await activation.result
+        } catch (error) {
+          outcome = stopping || signal.aborted
+            ? baseOutcome(index, task, 'cancelled', record.startedAt, activation.childId)
+            : {
+                ...baseOutcome(index, task, 'failed', record.startedAt, activation.childId),
+                error: failureText(error),
+              }
+        }
+        if (outcome === undefined) {
+          const stopReason = typeof settledResult?.stopReason === 'string' ? settledResult.stopReason : 'error'
+          const text = outputText(settledResult?.output)
+          const clipped = clipOutput(text, config.outputCharsPerTask)
+          const status = stopReason === 'completed' ? 'completed' : stopReason === 'aborted' ? 'cancelled' : 'failed'
+          outcome = {
+            ...baseOutcome(index, task, status, record.startedAt, activation.childId),
+            stopReason,
+            output: clipped.output,
+            outputTruncated: clipped.truncated,
+            ...typeof settledResult?.diagnostic === 'string' && settledResult.diagnostic !== '' ? { diagnostic: settledResult.diagnostic } : {},
+            ...status === 'failed' ? { error: `child stopped with reason "${stopReason}"` } : {},
+          }
+        }
+      }
+    } catch (error) {
+      outcome = stopping || signal.aborted
+        ? baseOutcome(index, task, 'cancelled', record.startedAt, undefined)
+        : {
+            ...baseOutcome(index, task, 'failed', record.startedAt, undefined),
+            error: failureText(error),
+          }
+    } finally {
+      await disposeRecord(record)
+      runningRecords.delete(index)
+    }
+    results[index] = outcome
+    states[index] = outcome.status
+    if (outcome.status === 'failed' && failFast) stopStarting = true
+  }
+
+  const taskView = (index) => {
+    const settledTask = results[index]
+    if (settledTask !== undefined) return settledTask
+    const running = states[index] === 'running'
+    const record = runningRecords.get(index)
+    return {
+      index: index + 1,
+      description: tasks[index].description,
+      status: running ? 'running' : 'pending',
+      ...record?.activation?.childId === undefined ? {} : { childId: record.activation.childId },
+      output: '',
+      outputTruncated: false,
+      durationMs: running ? Math.max(0, Date.now() - stateStarted[index]) : 0,
+    }
+  }
+
+  const report = () => {
+    const views = tasks.map((_, index) => taskView(index))
+    const counts = { completed: 0, failed: 0, cancelled: 0, skipped: 0, pending: 0, running: 0 }
+    for (const view of views) counts[view.status] += 1
+    return {
+      batchId: id,
+      mode,
+      status: settled ? (cancelled ? 'cancelled' : 'completed') : 'running',
+      total: tasks.length,
+      ...counts,
+      concurrency,
+      concurrencySource,
+      startedAt: new Date(startedAt).toISOString(),
+      ...finishedAt === undefined ? {} : { finishedAt: new Date(finishedAt).toISOString() },
+      durationMs: Math.max(0, (finishedAt ?? Date.now()) - startedAt),
+      results: views,
+    }
+  }
+
+  const run = async () => {
+    try {
+      while (cursor < tasks.length || runningPromises.size > 0) {
+        if (!stopStarting && !stopping && !signal.aborted) {
+          while (runningPromises.size < concurrency && cursor < tasks.length) {
+            const index = cursor
+            cursor += 1
+            const promise = runOne(index)
+            runningPromises.set(index, promise)
+            void promise.then(
+              () => runningPromises.delete(index),
+              () => runningPromises.delete(index),
+            )
+          }
+        }
+        if (runningPromises.size === 0) break
+        await Promise.race(runningPromises.values())
+      }
+    } catch (error) {
+      failure = failureText(error)
+      ctx.logger?.warn?.(`[subagent-batch] batch ${id} scheduler failed: ${failure}`)
+    } finally {
+      for (let index = 0; index < tasks.length; index++) {
+        if (results[index] === undefined) {
+          results[index] = {
+            ...baseOutcome(index, tasks[index], 'skipped', Date.now(), undefined),
+            error: cancelled
+              ? 'not started because the batch was cancelled'
+              : stopStarting
+                ? 'not started because fail_fast was triggered'
+                : failure === undefined
+                  ? 'not started'
+                  : `not started because the batch runner failed: ${failure}`,
+          }
+        }
+        if (states[index] === 'running') states[index] = results[index].status
+      }
+      settled = true
+      finishedAt = Date.now()
+      resolveDone(report())
+    }
+  }
+
+  void run()
+
+  return {
+    id,
+    parentId: parent.id,
+    mode,
+    get settled() { return settled },
+    done,
+    report,
+    cancel(reason) {
+      if (settled) return done
+      cancelled = true
+      controller.abort(reason ?? new Error('batch cancelled'))
+      return done
+    },
+  }
 }
 
 /**
@@ -738,26 +997,35 @@ function assertDepth(maxDepth, agent) {
 }
 
 /**
- * Model-facing render of one completed batch.
+ * Model-facing render of one batch report.
  * @param _args - call arguments (unused).
- * @param value - validated batch result.
+ * @param value - validated batch report.
+ * @param config - plugin configuration.
  * @returns tool content blocks.
  */
-function renderResult(_args, value) {
-  const headline = [
+function renderResult(_args, value, config) {
+  const counts = [
     `${value.completed}/${value.total} completed`,
     ...value.failed > 0 ? [`${value.failed} failed`] : [],
     ...value.cancelled > 0 ? [`${value.cancelled} cancelled`] : [],
     ...value.skipped > 0 ? [`${value.skipped} skipped`] : [],
+    ...value.running > 0 ? [`${value.running} running`] : [],
+    ...value.pending > 0 ? [`${value.pending} pending`] : [],
   ].join(', ')
   const lines = [
-    `Batch ${value.batchId}: ${headline} — concurrency ${value.concurrency} (${value.concurrencySource}), ${formatDuration(value.durationMs)}.`,
-    'Review each result below before accepting it; use a child id to continue that child when follow-up tools are available.',
+    `Batch ${value.batchId} (${value.mode}): ${value.status} — ${counts} — concurrency ${value.concurrency} (${value.concurrencySource}), ${formatDuration(value.durationMs)}.`,
   ]
+  if (value.status === 'running') {
+    lines.push(`Still running. Call \`${config.statusToolName}\` with batchId "${value.batchId}" to poll, or add wait:true to block until it settles.`)
+  } else {
+    lines.push('Review each result below before accepting it; use a child id to continue that child when follow-up tools are available.')
+  }
   for (const result of value.results) {
-    const identity = result.childId === undefined ? '' : `child ${result.childId}, `
-    const timing = formatDuration(result.durationMs)
-    let head = `[${result.index}] ${result.description} — ${result.status} (${identity}${timing})`
+    const details = []
+    if (result.childId !== undefined) details.push(`child ${result.childId}`)
+    if (result.status === 'pending') details.push('queued')
+    else details.push(formatDuration(result.durationMs))
+    let head = `[${result.index}] ${result.description} — ${result.status} (${details.join(', ')})`
     if ((result.status === 'failed' || result.status === 'skipped') && result.error !== undefined) head += `: ${result.error}`
     const body = result.output === '' ? (result.status === 'completed' ? '(no closing message)' : '') : result.output
     if (result.diagnostic !== undefined) lines.push(head, body, `diagnostic: ${result.diagnostic}`)

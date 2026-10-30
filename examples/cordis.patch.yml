@@ -19,3 +19,11 @@
         # true   -> the model may choose any window up to maxConcurrency
         allowModelConcurrency: false
         provider: spawn
+        # Default mode. `sync` blocks for the full report; `async` returns a
+        # batch id immediately and is collected with subagent_batch_status.
+        # A call may override this per batch.
+        mode: sync
+        # Concurrent async batches per session, and finished batches retained
+        # for later status reads.
+        maxAsyncBatches: 8
+        retainedBatches: 16

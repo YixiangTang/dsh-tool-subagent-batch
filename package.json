@@ -1,7 +1,7 @@
 {
   "name": "dsh-tool-subagent-batch",
-  "version": "0.2.0",
-  "description": "Rolling-window batch orchestration for DeepSeek Harness subagents: a bounded pool that refills as each child settles, with user-owned concurrency and per-task acceptance reports.",
+  "version": "0.3.0",
+  "description": "Rolling-window batch orchestration for DeepSeek Harness subagents with synchronous and asynchronous modes, user-owned concurrency, and per-task acceptance reports.",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -39,7 +39,9 @@
     "orchestration",
     "batch",
     "concurrency",
-    "rolling-window"
+    "rolling-window",
+    "async",
+    "sync"
   ],
   "license": "MIT",
   "engines": {
