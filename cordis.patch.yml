@@ -1,0 +1,10 @@
+# Bundle patch for `dsh-tool-subagent-batch`.
+#
+# This file is applied only when the package is installed as a DSH bundle
+# (`pnpm add` into a profile and selected in `dsh.profile.bundles`). The bare
+# package name resolves through the profile's runtime resolution.
+- insert:
+    - id: tool-subagent-batch
+      name: dsh-tool-subagent-batch
+      config:
+        provider: spawn

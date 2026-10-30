@@ -1,0 +1,21 @@
+# Zero-install mount for dsh-tool-subagent-batch.
+#
+# Append this patch list to:
+#   $DSH_HOME/profiles/<profile>/cordis.patch.yml
+#
+# Replace the path with the absolute path of this repository's index.js.
+# Forward slashes are recommended on Windows; the whole value is quoted so the
+# YAML parser keeps backslashes literal too.
+- insert:
+    - id: tool-subagent-batch
+      name: 'E:/path/to/dsh-tool-subagent-batch/index.js'
+      config:
+        # User-owned concurrency. Use an integer to pin it, or `auto` to read
+        # the machine and the Host admission cap at mount time.
+        concurrency: auto
+        maxConcurrency: 8
+        # false  -> only the user's value exists (default)
+        # "lower"-> the model may run a smaller batch
+        # true   -> the model may choose any window up to maxConcurrency
+        allowModelConcurrency: false
+        provider: spawn

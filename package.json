@@ -1,0 +1,48 @@
+{
+  "name": "dsh-tool-subagent-batch",
+  "version": "0.2.0",
+  "description": "Rolling-window batch orchestration for DeepSeek Harness subagents: a bounded pool that refills as each child settles, with user-owned concurrency and per-task acceptance reports.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./recommend": "./bin/recommend.mjs",
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "dsh-subagent-batch-recommend": "./bin/recommend.mjs"
+  },
+  "files": [
+    "index.js",
+    "bin",
+    "cordis.patch.yml",
+    "examples",
+    "README.md",
+    "README.zh.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "test:unit": "node test/concurrency.test.js && node test/batch.test.js",
+    "recommend": "node bin/recommend.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "subagent",
+    "orchestration",
+    "batch",
+    "concurrency",
+    "rolling-window"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  }
+}
