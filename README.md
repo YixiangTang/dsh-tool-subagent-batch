@@ -365,16 +365,6 @@ No install step is required: the package has no dependencies.
 
 Contributions are welcome. Keep the plugin dependency-free and add a test for every behavior change.
 
-### Publish this repository
-
-```sh
-git init -b main
-git add .
-git commit -m "feat: initial release"
-git remote add origin https://github.com/<you>/dsh-tool-subagent-batch.git
-git push -u origin main
-```
-
 ## License
 
 [MIT](LICENSE)

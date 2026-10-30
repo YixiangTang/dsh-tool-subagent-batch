@@ -365,16 +365,6 @@ npm run recommend # 本机并发推荐
 
 欢迎贡献。请保持零依赖，并为每个行为变更补充测试。
 
-### 发布到 GitHub
-
-```sh
-git init -b main
-git add .
-git commit -m "feat: initial release"
-git remote add origin https://github.com/<you>/dsh-tool-subagent-batch.git
-git push -u origin main
-```
-
 ## 许可证
 
 [MIT](LICENSE)
